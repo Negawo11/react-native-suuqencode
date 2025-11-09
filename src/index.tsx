@@ -1,5 +1,27 @@
-import Suuqencode from './NativeSuuqencode';
+import { NativeModules, NativeEventEmitter } from 'react-native';
 
-export function multiply(a: number, b: number): number {
-  return Suuqencode.multiply(a, b);
+const { Suuqencode } = NativeModules;
+
+const eventEmitter = new NativeEventEmitter(Suuqencode);
+
+export function encode(
+  base64Bitmap: string,
+  width: number,
+  height: number
+): void {
+  Suuqencode.encode(base64Bitmap, width, height);
+}
+
+export function addEncodedDataListener(
+  callback: (data: string) => void
+): () => void {
+  const subscription = eventEmitter.addListener(
+    'onEncodedData',
+    (data: any) => {
+      callback(data as string);
+    }
+  );
+  return () => {
+    subscription.remove();
+  };
 }

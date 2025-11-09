@@ -1,5 +1,7 @@
-#import <SuuqencodeSpec/SuuqencodeSpec.h>
+#import <React/RCTEventEmitter.h>
+#import <AVFoundation/AVFoundation.h>
+#import <VideoToolbox/VideoToolbox.h>
 
-@interface Suuqencode : NSObject <NativeSuuqencodeSpec>
+@interface Suuqencode : RCTEventEmitter
 
 @end
