@@ -77,7 +77,7 @@ void compressionOutputCallback(void *outputCallbackRefCon, void *sourceFrameRefC
 
     Suuqencode *encoder = (__bridge Suuqencode *)outputCallbackRefCon;
 
-    bool isKeyFrame = !CFDictionaryContainsKey( (CFArrayGetValueAtIndex(CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true), 0)), kCMSampleAttachmentKey_NotSync);
+    bool isKeyFrame = !CFDictionaryContainsKey( (CFDictionaryRef)CFArrayGetValueAtIndex(CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true), 0), (const void *)kCMSampleAttachmentKey_NotSync);
 
     if (isKeyFrame)
     {
