@@ -108,6 +108,8 @@ void compressionOutputCallback(void *outputCallbackRefCon,
   }
 
   Suuqencode *encoder = (__bridge Suuqencode *)outputCallbackRefCon;
+  const uint8_t startCode[] = {0x00, 0x00, 0x00, 0x01};
+  size_t startCodeSize = sizeof(startCode);
 
   bool isKeyFrame = !CFDictionaryContainsKey(
       (CFDictionaryRef)CFArrayGetValueAtIndex(
@@ -127,11 +129,15 @@ void compressionOutputCallback(void *outputCallbackRefCon,
     CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
         format, 1, &pparameterSet, &pparameterSetSize, &pparameterSetCount, 0);
 
-    NSData *sps = [NSData dataWithBytes:sparameterSet length:sparameterSetSize];
-    NSData *pps = [NSData dataWithBytes:pparameterSet length:pparameterSetSize];
+    NSMutableData *spsData = [NSMutableData dataWithBytes:startCode
+                                                   length:startCodeSize];
+    [spsData appendBytes:sparameterSet length:sparameterSetSize];
+    [encoder sendEncodedData:spsData];
 
-    [encoder sendEncodedData:sps];
-    [encoder sendEncodedData:pps];
+    NSMutableData *ppsData = [NSMutableData dataWithBytes:startCode
+                                                   length:startCodeSize];
+    [ppsData appendBytes:pparameterSet length:pparameterSetSize];
+    [encoder sendEncodedData:ppsData];
   }
 
   CMBlockBufferRef dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
@@ -140,8 +146,26 @@ void compressionOutputCallback(void *outputCallbackRefCon,
   CMBlockBufferGetDataPointer(dataBuffer, 0, &length, &totalLength,
                               &dataPointer);
 
-  NSData *naluData = [NSData dataWithBytes:dataPointer length:length];
-  [encoder sendEncodedData:naluData];
+  // Parse AVCC NAL units and convert to Annex B
+  size_t bufferOffset = 0;
+  static const int AVCCHeaderLength = 4;
+
+  while (bufferOffset < totalLength - AVCCHeaderLength) {
+    uint32_t NALUnitLength = 0;
+    memcpy(&NALUnitLength, dataPointer + bufferOffset, AVCCHeaderLength);
+
+    // Convert big-endian length to host endianness
+    NALUnitLength = CFSwapInt32BigToHost(NALUnitLength);
+
+    NSMutableData *naluData = [NSMutableData dataWithBytes:startCode
+                                                    length:startCodeSize];
+    [naluData appendBytes:(dataPointer + bufferOffset + AVCCHeaderLength)
+                   length:NALUnitLength];
+
+    [encoder sendEncodedData:naluData];
+
+    bufferOffset += AVCCHeaderLength + NALUnitLength;
+  }
 }
 
 - (void)sendEncodedData:(NSData *)data {
