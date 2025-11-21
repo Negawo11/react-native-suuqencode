@@ -29,10 +29,18 @@ RCT_EXPORT_METHOD(startEncode) {
     void *buf = [DMABuf buf];
     int width = [DMABuf width];
     int height = [DMABuf height];
+    int bytesPerRow = [DMABuf bytesPerRow];
 
     if (!buf) {
       return;
     }
+
+    size_t bufferSize = bytesPerRow * height;
+    void *bufferCopy = malloc(bufferSize);
+    if (!bufferCopy) {
+      return;
+    }
+    memcpy(bufferCopy, buf, bufferSize);
 
     dispatch_async(self.encodeQueue, ^{
       if (!self.compressionSession) {
@@ -41,11 +49,13 @@ RCT_EXPORT_METHOD(startEncode) {
 
       CVPixelBufferRef pixelBuffer = NULL;
       CVReturn status = CVPixelBufferCreateWithBytes(
-          kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, buf,
-          width * 4, NULL, NULL, NULL, &pixelBuffer);
+          kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+          bufferCopy, bytesPerRow, releasePixelBufferCallback, NULL, NULL,
+          &pixelBuffer);
 
       if (status != kCVReturnSuccess) {
         NSLog(@"Failed to create CVPixelBuffer");
+        free(bufferCopy);
         return;
       }
 
@@ -78,6 +88,10 @@ RCT_EXPORT_METHOD(startEncode) {
                        (__bridge CFTypeRef) @(20));
 
   VTCompressionSessionPrepareToEncodeFrames(_compressionSession);
+}
+
+void releasePixelBufferCallback(void *releaseRefCon, const void *baseAddress) {
+  free((void *)baseAddress);
 }
 
 void compressionOutputCallback(void *outputCallbackRefCon,
