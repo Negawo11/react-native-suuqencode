@@ -1,6 +1,6 @@
 {
   "name": "react-native-suuqencode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "h264 hardware encode support for iOS, developed by Suuqe Llc.",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
