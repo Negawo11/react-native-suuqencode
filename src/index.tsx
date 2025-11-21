@@ -4,12 +4,8 @@ const { Suuqencode } = NativeModules;
 
 const eventEmitter = new NativeEventEmitter(Suuqencode);
 
-export function encode(
-  base64Bitmap: string,
-  width: number,
-  height: number
-): void {
-  Suuqencode.encode(base64Bitmap, width, height);
+export function startEncode(): void {
+  Suuqencode.startEncode();
 }
 
 export function addEncodedDataListener(
