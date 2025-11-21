@@ -21,37 +21,39 @@ RCT_EXPORT_MODULE()
     return self;
 }
 
-RCT_EXPORT_METHOD(encode:(NSString *)base64Bitmap width:(int)width height:(int)height)
+#import <SuuqeDMABuf/DMABuf.h>
+
+RCT_EXPORT_METHOD(startEncode)
 {
-    dispatch_async(_encodeQueue, ^{
-        if (!self.compressionSession) {
-            [self setupCompressionSessionWithWidth:width height:height];
-        }
-
-        NSData *bitmapData = [[NSData alloc] initWithBase64EncodedString:base64Bitmap options:0];
-        if (!bitmapData) {
-            NSLog(@"Invalid base64 bitmap string");
+    [DMABuf setFrameChangeCallback:^{
+        void *buf = [DMABuf buf];
+        int width = [DMABuf width];
+        int height = [DMABuf height];
+        
+        if (!buf) {
             return;
         }
-
-        CVPixelBufferRef pixelBuffer = NULL;
-        CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32ARGB, nil, &pixelBuffer);
-        if (status != kCVReturnSuccess) {
-            NSLog(@"Failed to create CVPixelBuffer");
-            return;
-        }
-
-        CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-        void *pixelData = CVPixelBufferGetBaseAddress(pixelBuffer);
-        memcpy(pixelData, [bitmapData bytes], [bitmapData length]);
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-
-        CMTime presentationTimeStamp = CMTimeMake(self.frameCount++, 30);
-        VTEncodeInfoFlags flags;
-
-        VTCompressionSessionEncodeFrame(self.compressionSession, pixelBuffer, presentationTimeStamp, kCMTimeInvalid, NULL, NULL, &flags);
-        CVPixelBufferRelease(pixelBuffer);
-    });
+        
+        dispatch_async(self.encodeQueue, ^{
+            if (!self.compressionSession) {
+                [self setupCompressionSessionWithWidth:width height:height];
+            }
+            
+            CVPixelBufferRef pixelBuffer = NULL;
+            CVReturn status = CVPixelBufferCreateWithBytes(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, buf, width * 4, NULL, NULL, NULL, &pixelBuffer);
+            
+            if (status != kCVReturnSuccess) {
+                NSLog(@"Failed to create CVPixelBuffer");
+                return;
+            }
+            
+            CMTime presentationTimeStamp = CMTimeMake(self.frameCount++, 30);
+            VTEncodeInfoFlags flags;
+            
+            VTCompressionSessionEncodeFrame(self.compressionSession, pixelBuffer, presentationTimeStamp, kCMTimeInvalid, NULL, NULL, &flags);
+            CVPixelBufferRelease(pixelBuffer);
+        });
+    }];
 }
 
 - (void)setupCompressionSessionWithWidth:(int)width height:(int)height {
