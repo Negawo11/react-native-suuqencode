@@ -17,6 +17,7 @@
 @property(nonatomic) dispatch_queue_t audioEncodeQueue;
 @property(nonatomic) BOOL isRecordingAudio;
 @property(nonatomic) double audioSampleRate;
+@property(nonatomic, strong) NSString *audioFormat; // "flac" or "pcm"
 
 - (void)sendEncodedData:(NSData *)data;
 
@@ -189,6 +190,7 @@ void compressionOutputCallback(void *outputCallbackRefCon,
 #pragma mark - Audio Recording & FLAC Encoding
 
 RCT_EXPORT_METHOD(startAudioEncode:(double)sampleRate
+                  format:(NSString *)format
                   resolve:(RCTPromiseResolveBlock)resolve
                   reject:(RCTPromiseRejectBlock)reject) {
   if (self.isRecordingAudio) {
@@ -197,6 +199,7 @@ RCT_EXPORT_METHOD(startAudioEncode:(double)sampleRate
   }
 
   self.audioSampleRate = sampleRate > 0 ? sampleRate : 16000.0;
+  self.audioFormat = ([format isEqualToString:@"pcm"]) ? @"pcm" : @"flac";
 
   AVAudioSession *session = [AVAudioSession sharedInstance];
   [session requestRecordPermission:^(BOOL granted) {
@@ -220,7 +223,7 @@ RCT_EXPORT_METHOD(startAudioEncode:(double)sampleRate
         @"sampleRate": @(self.audioSampleRate),
         @"channels": @(1),
         @"bitsPerSample": @(16),
-        @"codec": @"flac"
+        @"codec": self.audioFormat
       };
       [self sendEventWithName:@"onAudioFormatInfo" body:formatInfo];
       resolve(@(YES));
@@ -245,6 +248,7 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
   self.flacConverter = nil;
   self.targetPCMFormat = nil;
   self.flacFormat = nil;
+  self.audioFormat = nil;
 }
 
 - (BOOL)setupAudioCaptureWithError:(NSError **)outError {
@@ -301,25 +305,27 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
     return NO;
   }
 
-  // FLAC output format
-  AudioStreamBasicDescription flacASBD = {};
-  flacASBD.mFormatID = kAudioFormatFLAC;
-  flacASBD.mSampleRate = self.audioSampleRate;
-  flacASBD.mChannelsPerFrame = 1;
-  flacASBD.mBitsPerChannel = 16;
-  flacASBD.mFramesPerPacket = 0;
-  flacASBD.mBytesPerPacket = 0;
-  flacASBD.mBytesPerFrame = 0;
-  flacASBD.mFormatFlags = 0;
+  // FLAC output format (only if FLAC mode is selected)
+  if ([self.audioFormat isEqualToString:@"flac"]) {
+    AudioStreamBasicDescription flacASBD = {};
+    flacASBD.mFormatID = kAudioFormatFLAC;
+    flacASBD.mSampleRate = self.audioSampleRate;
+    flacASBD.mChannelsPerFrame = 1;
+    flacASBD.mBitsPerChannel = 16;
+    flacASBD.mFramesPerPacket = 0;
+    flacASBD.mBytesPerPacket = 0;
+    flacASBD.mBytesPerFrame = 0;
+    flacASBD.mFormatFlags = 0;
 
-  self.flacFormat = [[AVAudioFormat alloc] initWithStreamDescription:&flacASBD];
-  if (!self.flacFormat) {
-    if (outError) {
-      *outError = [NSError errorWithDomain:@"SuuqencodeAudio"
-                                      code:-3
-                                  userInfo:@{NSLocalizedDescriptionKey: @"FLAC audio format not available on this device"}];
+    self.flacFormat = [[AVAudioFormat alloc] initWithStreamDescription:&flacASBD];
+    if (!self.flacFormat) {
+      if (outError) {
+        *outError = [NSError errorWithDomain:@"SuuqencodeAudio"
+                                        code:-3
+                                    userInfo:@{NSLocalizedDescriptionKey: @"FLAC audio format not available on this device"}];
+      }
+      return NO;
     }
-    return NO;
   }
 
   // PCM resampler: hardware format → target PCM
@@ -334,16 +340,18 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
     return NO;
   }
 
-  // FLAC encoder: target PCM → FLAC
-  self.flacConverter = [[AVAudioConverter alloc] initFromFormat:self.targetPCMFormat
-                                                      toFormat:self.flacFormat];
-  if (!self.flacConverter) {
-    if (outError) {
-      *outError = [NSError errorWithDomain:@"SuuqencodeAudio"
-                                      code:-5
-                                  userInfo:@{NSLocalizedDescriptionKey: @"Could not create FLAC encoder — FLAC encoding may not be supported on this OS version"}];
+  // FLAC encoder: target PCM → FLAC (only if FLAC mode is selected)
+  if ([self.audioFormat isEqualToString:@"flac"]) {
+    self.flacConverter = [[AVAudioConverter alloc] initFromFormat:self.targetPCMFormat
+                                                        toFormat:self.flacFormat];
+    if (!self.flacConverter) {
+      if (outError) {
+        *outError = [NSError errorWithDomain:@"SuuqencodeAudio"
+                                        code:-5
+                                    userInfo:@{NSLocalizedDescriptionKey: @"Could not create FLAC encoder — FLAC encoding may not be supported on this OS version"}];
+      }
+      return NO;
     }
-    return NO;
   }
 
   // Install tap on the input node using the hardware's native format
@@ -440,7 +448,17 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
     return;
   }
 
-  // Step 2: Encode PCM → FLAC
+  // Step 2: Encode PCM → FLAC, or emit raw PCM
+  if ([self.audioFormat isEqualToString:@"pcm"]) {
+    // PCM mode: emit the resampled 16-bit PCM data directly
+    NSData *pcmData = [NSData dataWithBytes:pcmBuffer.int16ChannelData[0]
+                                     length:pcmBuffer.frameLength * sizeof(int16_t)];
+    NSString *base64 = [pcmData base64EncodedStringWithOptions:0];
+    [self sendEventWithName:@"onAudioEncodedData" body:base64];
+    return;
+  }
+
+  // FLAC mode
   AVAudioCompressedBuffer *flacBuffer =
       [[AVAudioCompressedBuffer alloc] initWithFormat:self.flacFormat
                                        packetCapacity:8
