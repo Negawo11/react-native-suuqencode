@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { View, Text, Button, StyleSheet, ScrollView } from 'react-native';
-import { encode, addEncodedDataListener } from 'react-native-suuqencode';
+import { addEncodedDataListener } from 'react-native-suuqencode';
 
 export default function App() {
   const [encodedData, setEncodedData] = useState<string[]>([]);
@@ -17,9 +17,9 @@ export default function App() {
 
   const handleEncode = () => {
     // 1x1 red pixel
-    const base64Bitmap =
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==';
-    encode(base64Bitmap, 1, 1);
+    /*const base64Bitmap =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==';*/
+    // encode(base64Bitmap, 1, 1);
   };
 
   return (

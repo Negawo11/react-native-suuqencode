@@ -3,9 +3,20 @@
 
 @interface Suuqencode ()
 
+// Video encoding properties
 @property(nonatomic) VTCompressionSessionRef compressionSession;
 @property(nonatomic) dispatch_queue_t encodeQueue;
 @property(nonatomic) int frameCount;
+
+// Audio recording + FLAC encoding properties
+@property(nonatomic, strong) AVAudioEngine *audioEngine;
+@property(nonatomic, strong) AVAudioConverter *pcmConverter;
+@property(nonatomic, strong) AVAudioConverter *flacConverter;
+@property(nonatomic, strong) AVAudioFormat *targetPCMFormat;
+@property(nonatomic, strong) AVAudioFormat *flacFormat;
+@property(nonatomic) dispatch_queue_t audioEncodeQueue;
+@property(nonatomic) BOOL isRecordingAudio;
+@property(nonatomic) double audioSampleRate;
 
 - (void)sendEncodedData:(NSData *)data;
 
@@ -20,6 +31,8 @@ RCT_EXPORT_MODULE()
   if (self) {
     _encodeQueue = dispatch_queue_create("com.suuqencode.encodequeue",
                                          DISPATCH_QUEUE_SERIAL);
+    _audioEncodeQueue = dispatch_queue_create("com.suuqencode.audioencodequeue",
+                                              DISPATCH_QUEUE_SERIAL);
   }
   return self;
 }
@@ -173,8 +186,297 @@ void compressionOutputCallback(void *outputCallbackRefCon,
   [self sendEventWithName:@"onEncodedData" body:base64Encoded];
 }
 
+#pragma mark - Audio Recording & FLAC Encoding
+
+RCT_EXPORT_METHOD(startAudioEncode:(double)sampleRate
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject) {
+  if (self.isRecordingAudio) {
+    reject(@"ALREADY_RECORDING", @"Audio recording is already in progress", nil);
+    return;
+  }
+
+  self.audioSampleRate = sampleRate > 0 ? sampleRate : 16000.0;
+
+  AVAudioSession *session = [AVAudioSession sharedInstance];
+  [session requestRecordPermission:^(BOOL granted) {
+    if (!granted) {
+      reject(@"PERMISSION_DENIED", @"Microphone permission was denied", nil);
+      return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+      NSError *setupError = nil;
+      BOOL success = [self setupAudioCaptureWithError:&setupError];
+      if (!success) {
+        reject(@"SETUP_FAILED",
+               setupError ? setupError.localizedDescription : @"Failed to set up audio capture",
+               setupError);
+        return;
+      }
+
+      // Emit format info so the receiver knows the audio parameters
+      NSDictionary *formatInfo = @{
+        @"sampleRate": @(self.audioSampleRate),
+        @"channels": @(1),
+        @"bitsPerSample": @(16),
+        @"codec": @"flac"
+      };
+      [self sendEventWithName:@"onAudioFormatInfo" body:formatInfo];
+      resolve(@(YES));
+    });
+  }];
+}
+
+RCT_EXPORT_METHOD(stopAudioEncode) {
+  if (!self.isRecordingAudio) {
+    return;
+  }
+
+  self.isRecordingAudio = NO;
+
+  if (self.audioEngine) {
+    [self.audioEngine.inputNode removeTapOnBus:0];
+    [self.audioEngine stop];
+    self.audioEngine = nil;
+  }
+
+  self.pcmConverter = nil;
+  self.flacConverter = nil;
+  self.targetPCMFormat = nil;
+  self.flacFormat = nil;
+}
+
+- (BOOL)setupAudioCaptureWithError:(NSError **)outError {
+  AVAudioSession *session = [AVAudioSession sharedInstance];
+  NSError *error = nil;
+
+  [session setCategory:AVAudioSessionCategoryPlayAndRecord
+           withOptions:(AVAudioSessionCategoryOptionDefaultToSpeaker |
+                        AVAudioSessionCategoryOptionAllowBluetooth)
+                 error:&error];
+  if (error) {
+    if (outError) *outError = error;
+    return NO;
+  }
+
+  [session setActive:YES error:&error];
+  if (error) {
+    if (outError) *outError = error;
+    return NO;
+  }
+
+  // Initialize audio engine
+  self.audioEngine = [[AVAudioEngine alloc] init];
+  AVAudioInputNode *inputNode = self.audioEngine.inputNode;
+  AVAudioFormat *hardwareFormat = [inputNode outputFormatForBus:0];
+
+  if (!hardwareFormat || hardwareFormat.sampleRate == 0) {
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"SuuqencodeAudio"
+                                      code:-1
+                                  userInfo:@{NSLocalizedDescriptionKey: @"Could not get hardware audio format"}];
+    }
+    return NO;
+  }
+
+  // Target PCM format: 16-bit signed integer, mono, at requested sample rate
+  AudioStreamBasicDescription pcmASBD = {};
+  pcmASBD.mFormatID = kAudioFormatLinearPCM;
+  pcmASBD.mSampleRate = self.audioSampleRate;
+  pcmASBD.mChannelsPerFrame = 1;
+  pcmASBD.mBitsPerChannel = 16;
+  pcmASBD.mBytesPerFrame = 2;
+  pcmASBD.mBytesPerPacket = 2;
+  pcmASBD.mFramesPerPacket = 1;
+  pcmASBD.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+
+  self.targetPCMFormat = [[AVAudioFormat alloc] initWithStreamDescription:&pcmASBD];
+  if (!self.targetPCMFormat) {
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"SuuqencodeAudio"
+                                      code:-2
+                                  userInfo:@{NSLocalizedDescriptionKey: @"Could not create target PCM format"}];
+    }
+    return NO;
+  }
+
+  // FLAC output format
+  AudioStreamBasicDescription flacASBD = {};
+  flacASBD.mFormatID = kAudioFormatFLAC;
+  flacASBD.mSampleRate = self.audioSampleRate;
+  flacASBD.mChannelsPerFrame = 1;
+  flacASBD.mBitsPerChannel = 16;
+  flacASBD.mFramesPerPacket = 0;
+  flacASBD.mBytesPerPacket = 0;
+  flacASBD.mBytesPerFrame = 0;
+  flacASBD.mFormatFlags = 0;
+
+  self.flacFormat = [[AVAudioFormat alloc] initWithStreamDescription:&flacASBD];
+  if (!self.flacFormat) {
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"SuuqencodeAudio"
+                                      code:-3
+                                  userInfo:@{NSLocalizedDescriptionKey: @"FLAC audio format not available on this device"}];
+    }
+    return NO;
+  }
+
+  // PCM resampler: hardware format → target PCM
+  self.pcmConverter = [[AVAudioConverter alloc] initFromFormat:hardwareFormat
+                                                     toFormat:self.targetPCMFormat];
+  if (!self.pcmConverter) {
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"SuuqencodeAudio"
+                                      code:-4
+                                  userInfo:@{NSLocalizedDescriptionKey: @"Could not create PCM resampler"}];
+    }
+    return NO;
+  }
+
+  // FLAC encoder: target PCM → FLAC
+  self.flacConverter = [[AVAudioConverter alloc] initFromFormat:self.targetPCMFormat
+                                                      toFormat:self.flacFormat];
+  if (!self.flacConverter) {
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"SuuqencodeAudio"
+                                      code:-5
+                                  userInfo:@{NSLocalizedDescriptionKey: @"Could not create FLAC encoder — FLAC encoding may not be supported on this OS version"}];
+    }
+    return NO;
+  }
+
+  // Install tap on the input node using the hardware's native format
+  __weak Suuqencode *weakSelf = self;
+  [inputNode installTapOnBus:0
+                  bufferSize:4096
+                      format:hardwareFormat
+                       block:^(AVAudioPCMBuffer * _Nonnull buffer, AVAudioTime * _Nonnull when) {
+    __strong Suuqencode *strongSelf = weakSelf;
+    if (!strongSelf || !strongSelf.isRecordingAudio) return;
+
+    // Copy the buffer so we can safely dispatch off the realtime audio thread
+    AVAudioPCMBuffer *bufferCopy = [[AVAudioPCMBuffer alloc] initWithPCMFormat:buffer.format
+                                                                 frameCapacity:buffer.frameLength];
+    bufferCopy.frameLength = buffer.frameLength;
+
+    if (hardwareFormat.commonFormat == AVAudioPCMFormatFloat32) {
+      for (AVAudioChannelCount ch = 0; ch < hardwareFormat.channelCount; ch++) {
+        memcpy(bufferCopy.floatChannelData[ch],
+               buffer.floatChannelData[ch],
+               buffer.frameLength * sizeof(float));
+      }
+    } else if (hardwareFormat.commonFormat == AVAudioPCMFormatInt16) {
+      for (AVAudioChannelCount ch = 0; ch < hardwareFormat.channelCount; ch++) {
+        memcpy(bufferCopy.int16ChannelData[ch],
+               buffer.int16ChannelData[ch],
+               buffer.frameLength * sizeof(int16_t));
+      }
+    } else if (hardwareFormat.commonFormat == AVAudioPCMFormatInt32) {
+      for (AVAudioChannelCount ch = 0; ch < hardwareFormat.channelCount; ch++) {
+        memcpy(bufferCopy.int32ChannelData[ch],
+               buffer.int32ChannelData[ch],
+               buffer.frameLength * sizeof(int32_t));
+      }
+    } else {
+      // Float64 or other — fallback to raw bytes
+      size_t byteCount = buffer.frameLength * hardwareFormat.streamDescription->mBytesPerFrame;
+      for (AVAudioChannelCount ch = 0; ch < hardwareFormat.channelCount; ch++) {
+        memcpy(bufferCopy.floatChannelData[ch],
+               buffer.floatChannelData[ch],
+               byteCount);
+      }
+    }
+
+    dispatch_async(strongSelf.audioEncodeQueue, ^{
+      [strongSelf processAudioBuffer:bufferCopy];
+    });
+  }];
+
+  // Start the engine
+  [self.audioEngine startAndReturnError:&error];
+  if (error) {
+    if (outError) *outError = error;
+    [inputNode removeTapOnBus:0];
+    self.audioEngine = nil;
+    return NO;
+  }
+
+  self.isRecordingAudio = YES;
+  return YES;
+}
+
+- (void)processAudioBuffer:(AVAudioPCMBuffer *)inputBuffer {
+  if (!self.isRecordingAudio) return;
+
+  // Step 1: Resample hardware PCM → target PCM (16kHz mono int16)
+  double sampleRateRatio = self.targetPCMFormat.sampleRate / inputBuffer.format.sampleRate;
+  AVAudioFrameCount outputFrameCapacity = (AVAudioFrameCount)ceil(inputBuffer.frameLength * sampleRateRatio) + 16;
+
+  AVAudioPCMBuffer *pcmBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:self.targetPCMFormat
+                                                              frameCapacity:outputFrameCapacity];
+  NSError *error = nil;
+  __block BOOL pcmInputProvided = NO;
+
+  AVAudioConverterOutputStatus pcmStatus = [self.pcmConverter
+      convertToBuffer:pcmBuffer
+                error:&error
+    withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets,
+                                                   AVAudioConverterInputStatus *outStatus) {
+      if (pcmInputProvided) {
+        *outStatus = AVAudioConverterInputStatus_NoDataNow;
+        return nil;
+      }
+      pcmInputProvided = YES;
+      *outStatus = AVAudioConverterInputStatus_HaveData;
+      return inputBuffer;
+    }];
+
+  if (error) {
+    NSLog(@"[Suuqencode] PCM resampling error: %@", error);
+    return;
+  }
+  if (pcmBuffer.frameLength == 0) {
+    return;
+  }
+
+  // Step 2: Encode PCM → FLAC
+  AVAudioCompressedBuffer *flacBuffer =
+      [[AVAudioCompressedBuffer alloc] initWithFormat:self.flacFormat
+                                       packetCapacity:8
+                                    maximumPacketSize:65536];
+
+  __block BOOL flacInputProvided = NO;
+  AVAudioConverterOutputStatus flacStatus = [self.flacConverter
+      convertToBuffer:flacBuffer
+                error:&error
+    withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets,
+                                                   AVAudioConverterInputStatus *outStatus) {
+      if (flacInputProvided) {
+        *outStatus = AVAudioConverterInputStatus_NoDataNow;
+        return nil;
+      }
+      flacInputProvided = YES;
+      *outStatus = AVAudioConverterInputStatus_HaveData;
+      return pcmBuffer;
+    }];
+
+  if (error) {
+    NSLog(@"[Suuqencode] FLAC encoding error: %@", error);
+    return;
+  }
+
+  if ((flacStatus == AVAudioConverterOutputStatus_HaveData ||
+       flacStatus == AVAudioConverterOutputStatus_InputRanDry) &&
+      flacBuffer.byteLength > 0) {
+    NSData *flacData = [NSData dataWithBytes:flacBuffer.data length:flacBuffer.byteLength];
+    NSString *base64 = [flacData base64EncodedStringWithOptions:0];
+    [self sendEventWithName:@"onAudioEncodedData" body:base64];
+  }
+}
+
 - (NSArray<NSString *> *)supportedEvents {
-  return @[ @"onEncodedData" ];
+  return @[ @"onEncodedData", @"onAudioEncodedData", @"onAudioFormatInfo" ];
 }
 
 + (BOOL)requiresMainQueueSetup {
