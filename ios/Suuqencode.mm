@@ -1,4 +1,5 @@
 #import "Suuqencode.h"
+#import "SuuqeHttpConnection.h"
 #import <SuuqeDMABuf/DMABuf.h>
 
 @interface Suuqencode ()
@@ -19,6 +20,10 @@
 @property(nonatomic) double audioSampleRate;
 @property(nonatomic, strong) NSString *audioFormat; // "flac" or "pcm"
 
+// HTTP streaming connections
+@property(nonatomic, strong)
+    NSMutableDictionary<NSString *, SuuqeHttpConnection *> *httpConnections;
+
 - (void)sendEncodedData:(NSData *)data;
 
 @end
@@ -34,6 +39,7 @@ RCT_EXPORT_MODULE()
                                          DISPATCH_QUEUE_SERIAL);
     _audioEncodeQueue = dispatch_queue_create("com.suuqencode.audioencodequeue",
                                               DISPATCH_QUEUE_SERIAL);
+    _httpConnections = [NSMutableDictionary new];
   }
   return self;
 }
@@ -493,12 +499,154 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
   }
 }
 
+#pragma mark - HTTP Streaming
+
+RCT_EXPORT_METHOD(httpCreate:(NSString *)connectionId
+                  url:(NSString *)urlString
+                  method:(NSString *)method
+                  headers:(NSDictionary *)headers
+                  bufferSize:(double)bufferSize) {
+  NSURL *url = [NSURL URLWithString:urlString];
+  if (!url) {
+    [self sendEventWithName:@"onHttpError"
+                       body:@{
+                         @"connectionId" : connectionId,
+                         @"error" : @"Invalid URL"
+                       }];
+    return;
+  }
+
+  SuuqeHttpConnection *connection =
+      [[SuuqeHttpConnection alloc] initWithConnectionId:connectionId
+                                                    url:url
+                                                 method:method
+                                                headers:headers
+                                             bufferSize:(NSInteger)bufferSize];
+  connection.delegate = self;
+
+  @synchronized(self.httpConnections) {
+    self.httpConnections[connectionId] = connection;
+  }
+
+  [connection start];
+}
+
+RCT_EXPORT_METHOD(httpWrite:(NSString *)connectionId
+                  base64Data:(NSString *)base64Data) {
+  SuuqeHttpConnection *connection;
+  @synchronized(self.httpConnections) {
+    connection = self.httpConnections[connectionId];
+  }
+  if (!connection) return;
+
+  NSData *data = [[NSData alloc] initWithBase64EncodedString:base64Data
+                                                     options:0];
+  if (data) {
+    [connection writeData:data];
+  }
+}
+
+RCT_EXPORT_METHOD(httpFinishWriting:(NSString *)connectionId) {
+  SuuqeHttpConnection *connection;
+  @synchronized(self.httpConnections) {
+    connection = self.httpConnections[connectionId];
+  }
+  if (connection) {
+    [connection finishWriting];
+  }
+}
+
+RCT_EXPORT_METHOD(httpClose:(NSString *)connectionId) {
+  SuuqeHttpConnection *connection;
+  @synchronized(self.httpConnections) {
+    connection = self.httpConnections[connectionId];
+    [self.httpConnections removeObjectForKey:connectionId];
+  }
+  if (connection) {
+    [connection close];
+  }
+}
+
+#pragma mark - SuuqeHttpConnectionDelegate
+
+- (void)httpConnection:(NSString *)connectionId
+    didReceiveResponse:(NSInteger)statusCode
+               headers:(NSDictionary *)headers {
+  [self sendEventWithName:@"onHttpResponse"
+                     body:@{
+                       @"connectionId" : connectionId,
+                       @"statusCode" : @(statusCode),
+                       @"headers" : headers ?: @{}
+                     }];
+}
+
+- (void)httpConnection:(NSString *)connectionId
+        didReceiveData:(NSData *)data {
+  NSString *base64 = [data base64EncodedStringWithOptions:0];
+  [self sendEventWithName:@"onHttpData"
+                     body:@{
+                       @"connectionId" : connectionId,
+                       @"data" : base64
+                     }];
+}
+
+- (void)httpConnection:(NSString *)connectionId
+         didWriteBytes:(NSInteger)bytesWritten
+      totalBytesQueued:(NSInteger)totalQueued {
+  [self sendEventWithName:@"onHttpWriteComplete"
+                     body:@{
+                       @"connectionId" : connectionId,
+                       @"bytesWritten" : @(bytesWritten),
+                       @"totalBytesQueued" : @(totalQueued)
+                     }];
+}
+
+- (void)httpConnection:(NSString *)connectionId
+  didCompleteWithError:(NSError *)error {
+  if (error) {
+    [self sendEventWithName:@"onHttpError"
+                       body:@{
+                         @"connectionId" : connectionId,
+                         @"error" : error.localizedDescription ?: @"Unknown error"
+                       }];
+  } else {
+    [self sendEventWithName:@"onHttpComplete"
+                       body:@{@"connectionId" : connectionId}];
+  }
+
+  // Remove completed connection from tracking
+  @synchronized(self.httpConnections) {
+    [self.httpConnections removeObjectForKey:connectionId];
+  }
+}
+
+#pragma mark - Events
+
 - (NSArray<NSString *> *)supportedEvents {
-  return @[ @"onEncodedData", @"onAudioEncodedData", @"onAudioFormatInfo" ];
+  return @[
+    @"onEncodedData",
+    @"onAudioEncodedData",
+    @"onAudioFormatInfo",
+    @"onHttpResponse",
+    @"onHttpData",
+    @"onHttpWriteComplete",
+    @"onHttpError",
+    @"onHttpComplete"
+  ];
 }
 
 + (BOOL)requiresMainQueueSetup {
   return NO;
+}
+
+- (void)invalidate {
+  // Clean up all HTTP connections when the module is invalidated
+  @synchronized(self.httpConnections) {
+    for (SuuqeHttpConnection *conn in self.httpConnections.allValues) {
+      [conn close];
+    }
+    [self.httpConnections removeAllObjects];
+  }
 }
 
 @end

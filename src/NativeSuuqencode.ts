@@ -6,6 +6,18 @@ export interface Spec extends TurboModule {
   stopAudioEncode(): void;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
+
+  // HTTP streaming
+  httpCreate(
+    connectionId: string,
+    url: string,
+    method: string,
+    headers: Object,
+    bufferSize: number
+  ): void;
+  httpWrite(connectionId: string, base64Data: string): void;
+  httpFinishWriting(connectionId: string): void;
+  httpClose(connectionId: string): void;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('Suuqencode');

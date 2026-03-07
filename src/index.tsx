@@ -85,3 +85,234 @@ export function addAudioFormatInfoListener(
     subscription.remove();
   };
 }
+
+// ---------------------------------------------------------------------------
+// HTTP Streaming
+// ---------------------------------------------------------------------------
+
+export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+export interface HttpConnectionConfig {
+  /** The URL to connect to (http:// or https://) */
+  url: string;
+  /** HTTP method. Defaults to 'GET'. */
+  method?: HttpMethod;
+  /** Optional request headers. */
+  headers?: Record<string, string>;
+  /**
+   * Size of the internal stream buffer in bytes.
+   * Controls how much data can be buffered before backpressure kicks in.
+   * Defaults to 65536 (64 KB).
+   */
+  bufferSize?: number;
+}
+
+/** Event payload for an HTTP response header. */
+export interface HttpResponseEvent {
+  statusCode: number;
+  headers: Record<string, string>;
+}
+
+/** Event payload for a chunk of response data. */
+export interface HttpDataEvent {
+  /** Base-64 encoded chunk */
+  data: string;
+}
+
+/** Event payload emitted after a queued write has been flushed to the socket. */
+export interface HttpWriteCompleteEvent {
+  /** Bytes written for this chunk. */
+  bytesWritten: number;
+  /** Cumulative bytes queued since connection creation. */
+  totalBytesQueued: number;
+}
+
+let _httpConnectionCounter = 0;
+
+/**
+ * FinalizationRegistry that automatically closes abandoned connections
+ * when the JS `HttpConnection` object is garbage-collected.
+ */
+const _httpCleanupRegistry = new FinalizationRegistry(
+  (connectionId: string) => {
+    try {
+      Suuqencode.httpClose(connectionId);
+    } catch {
+      // Module may have been torn down; safe to ignore.
+    }
+  }
+);
+
+/**
+ * Represents a single streaming HTTP connection.
+ *
+ * ## Usage
+ * ```ts
+ * const conn = new HttpConnection({
+ *   url: 'https://example.com/upload',
+ *   method: 'POST',
+ *   headers: { 'Content-Type': 'application/octet-stream' },
+ *   bufferSize: 131072, // 128 KB
+ * });
+ *
+ * conn.onResponse((statusCode, headers) => { ... });
+ * conn.onData((base64Chunk) => { ... });
+ * conn.onWriteComplete((bytesWritten, totalBytesQueued) => { ... });
+ * conn.onError((error) => { ... });
+ * conn.onComplete(() => { ... });
+ *
+ * conn.write(base64EncodedChunk);
+ * conn.finishWriting(); // signal end of request body
+ *
+ * // When done, or to abort:
+ * conn.close();
+ * ```
+ *
+ * If you drop all references without calling `.close()`, the connection
+ * will be cleaned up automatically when the object is garbage-collected.
+ */
+export class HttpConnection {
+  /** Unique native-side identifier for this connection. */
+  readonly connectionId: string;
+  private _closed = false;
+  private _subscriptions: (() => void)[] = [];
+
+  constructor(config: HttpConnectionConfig) {
+    this.connectionId = `http_${++_httpConnectionCounter}_${Date.now()}`;
+
+    Suuqencode.httpCreate(
+      this.connectionId,
+      config.url,
+      config.method ?? 'GET',
+      config.headers ?? {},
+      config.bufferSize ?? 65536
+    );
+
+    // Register for GC-based cleanup. If the user never calls .close() and
+    // drops all references, the native connection will still be torn down.
+    _httpCleanupRegistry.register(this, this.connectionId, this);
+  }
+
+  // ---- Write API ----------------------------------------------------------
+
+  /**
+   * Enqueue base-64 encoded data to be streamed to the server (POST/PUT/PATCH).
+   * The data is buffered internally and flushed as the socket becomes writable.
+   * Listen to `onWriteComplete` to manage backpressure.
+   */
+  write(base64Data: string): void {
+    if (this._closed) {
+      throw new Error('HttpConnection is closed');
+    }
+    Suuqencode.httpWrite(this.connectionId, base64Data);
+  }
+
+  /**
+   * Signal that no more data will be written to the request body.
+   * For GET/DELETE this is a no-op.
+   */
+  finishWriting(): void {
+    if (this._closed) return;
+    Suuqencode.httpFinishWriting(this.connectionId);
+  }
+
+  /**
+   * Immediately abort all transfers and close the underlying socket.
+   * This is synchronous from the caller's perspective — the native task is
+   * cancelled and the session is invalidated before this method returns.
+   * Safe to call multiple times.
+   */
+  close(): void {
+    if (this._closed) return;
+    this._closed = true;
+    // Remove all event subscriptions
+    for (const unsub of this._subscriptions) {
+      unsub();
+    }
+    this._subscriptions = [];
+    Suuqencode.httpClose(this.connectionId);
+    _httpCleanupRegistry.unregister(this);
+  }
+
+  // ---- Event Subscriptions ------------------------------------------------
+
+  /**
+   * Fired when the HTTP response headers are received.
+   * @returns An unsubscribe function.
+   */
+  onResponse(
+    callback: (statusCode: number, headers: Record<string, string>) => void
+  ): () => void {
+    return this._on('onHttpResponse', (event: any) => {
+      if (event.connectionId === this.connectionId) {
+        callback(event.statusCode, event.headers);
+      }
+    });
+  }
+
+  /**
+   * Fired for each chunk of response body data received from the server.
+   * The `base64Data` parameter is the chunk base-64 encoded.
+   * @returns An unsubscribe function.
+   */
+  onData(callback: (base64Data: string) => void): () => void {
+    return this._on('onHttpData', (event: any) => {
+      if (event.connectionId === this.connectionId) {
+        callback(event.data);
+      }
+    });
+  }
+
+  /**
+   * Fired after a previously enqueued write chunk has been fully flushed
+   * to the underlying socket. Use this for backpressure management.
+   * @returns An unsubscribe function.
+   */
+  onWriteComplete(
+    callback: (bytesWritten: number, totalBytesQueued: number) => void
+  ): () => void {
+    return this._on('onHttpWriteComplete', (event: any) => {
+      if (event.connectionId === this.connectionId) {
+        callback(event.bytesWritten, event.totalBytesQueued);
+      }
+    });
+  }
+
+  /**
+   * Fired when an error occurs (network failure, invalid URL, etc.).
+   * @returns An unsubscribe function.
+   */
+  onError(callback: (error: string) => void): () => void {
+    return this._on('onHttpError', (event: any) => {
+      if (event.connectionId === this.connectionId) {
+        callback(event.error);
+      }
+    });
+  }
+
+  /**
+   * Fired when the HTTP transaction completes successfully
+   * (response body fully received, no errors).
+   * @returns An unsubscribe function.
+   */
+  onComplete(callback: () => void): () => void {
+    return this._on('onHttpComplete', (event: any) => {
+      if (event.connectionId === this.connectionId) {
+        callback();
+      }
+    });
+  }
+
+  // ---- Internal -----------------------------------------------------------
+
+  private _on(eventName: string, handler: (event: any) => void): () => void {
+    const subscription = eventEmitter.addListener(eventName, handler);
+    const unsub = () => {
+      subscription.remove();
+      const idx = this._subscriptions.indexOf(unsub);
+      if (idx !== -1) this._subscriptions.splice(idx, 1);
+    };
+    this._subscriptions.push(unsub);
+    return unsub;
+  }
+}
