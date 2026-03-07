@@ -130,20 +130,6 @@ export interface HttpWriteCompleteEvent {
 let _httpConnectionCounter = 0;
 
 /**
- * FinalizationRegistry that automatically closes abandoned connections
- * when the JS `HttpConnection` object is garbage-collected.
- */
-const _httpCleanupRegistry = new FinalizationRegistry(
-  (connectionId: string) => {
-    try {
-      Suuqencode.httpClose(connectionId);
-    } catch {
-      // Module may have been torn down; safe to ignore.
-    }
-  }
-);
-
-/**
  * Represents a single streaming HTTP connection.
  *
  * ## Usage
@@ -169,7 +155,8 @@ const _httpCleanupRegistry = new FinalizationRegistry(
  * ```
  *
  * If you drop all references without calling `.close()`, the connection
- * will be cleaned up automatically when the object is garbage-collected.
+ * will be cleaned up when the native module is invalidated (e.g. on reload).
+ * Always prefer calling `.close()` explicitly when done.
  */
 export class HttpConnection {
   /** Unique native-side identifier for this connection. */
@@ -188,9 +175,8 @@ export class HttpConnection {
       config.bufferSize ?? 65536
     );
 
-    // Register for GC-based cleanup. If the user never calls .close() and
-    // drops all references, the native connection will still be torn down.
-    _httpCleanupRegistry.register(this, this.connectionId, this);
+    // Cleanup of abandoned connections is handled natively via the
+    // module's -invalidate method (called on reload / teardown).
   }
 
   // ---- Write API ----------------------------------------------------------
@@ -231,7 +217,6 @@ export class HttpConnection {
     }
     this._subscriptions = [];
     Suuqencode.httpClose(this.connectionId);
-    _httpCleanupRegistry.unregister(this);
   }
 
   // ---- Event Subscriptions ------------------------------------------------
