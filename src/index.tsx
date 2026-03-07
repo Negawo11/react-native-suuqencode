@@ -1,4 +1,4 @@
-import { NativeModules, NativeEventEmitter } from 'react-native';
+import { NativeEventEmitter, NativeModules } from 'react-native';
 
 const { Suuqencode } = NativeModules;
 
@@ -80,6 +80,53 @@ export function addAudioFormatInfoListener(
     (info: any) => {
       callback(info as AudioFormatInfo);
     }
+  );
+  return () => {
+    subscription.remove();
+  };
+}
+
+// ---------------------------------------------------------------------------
+// PCM Streaming Playback
+// ---------------------------------------------------------------------------
+
+/**
+ * Start the native PCM streaming player. Audio chunks pushed via
+ * `writePcmData` are queued on an AVAudioPlayerNode for gapless,
+ * sample-accurate playback — no file I/O or JS-side Sound objects.
+ *
+ * @param sampleRate Sample rate of the PCM data (default 24000 for Gemini output)
+ * @param channels   Number of audio channels (default 1 = mono)
+ */
+export function startPcmPlayer(
+  sampleRate: number = 24000,
+  channels: number = 1
+): Promise<boolean> {
+  return Suuqencode.startPcmPlayer(sampleRate, channels);
+}
+
+/**
+ * Push a base64-encoded chunk of signed-16-bit-LE PCM data to the native
+ * player. The chunk is scheduled on the audio graph immediately and will
+ * play seamlessly after any previously queued chunks with zero gap.
+ */
+export function writePcmData(base64Data: string): void {
+  Suuqencode.writePcmData(base64Data);
+}
+
+/**
+ * Stop the PCM player and release audio engine resources.
+ */
+export function stopPcmPlayer(): void {
+  Suuqencode.stopPcmPlayer();
+}
+
+/**
+ * Listen for the player-stopped event.
+ */
+export function addPcmPlayerStoppedListener(callback: () => void): () => void {
+  const subscription = eventEmitter.addListener('onPcmPlayerStopped', () =>
+    callback()
   );
   return () => {
     subscription.remove();

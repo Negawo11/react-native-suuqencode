@@ -7,6 +7,11 @@ export interface Spec extends TurboModule {
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 
+  // PCM streaming playback
+  startPcmPlayer(sampleRate: number, channels: number): Promise<boolean>;
+  writePcmData(base64Data: string): void;
+  stopPcmPlayer(): void;
+
   // HTTP streaming
   httpCreate(
     connectionId: string,

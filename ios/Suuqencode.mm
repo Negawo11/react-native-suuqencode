@@ -24,6 +24,13 @@
 @property(nonatomic, strong)
     NSMutableDictionary<NSString *, SuuqeHttpConnection *> *httpConnections;
 
+// PCM streaming playback
+@property(nonatomic, strong) AVAudioEngine *playbackEngine;
+@property(nonatomic, strong) AVAudioPlayerNode *playerNode;
+@property(nonatomic, strong) AVAudioFormat *playbackFormat;
+@property(nonatomic) BOOL isPlaybackActive;
+@property(nonatomic) dispatch_queue_t playbackQueue;
+
 - (void)sendEncodedData:(NSData *)data;
 
 @end
@@ -40,6 +47,8 @@ RCT_EXPORT_MODULE()
     _audioEncodeQueue = dispatch_queue_create("com.suuqencode.audioencodequeue",
                                               DISPATCH_QUEUE_SERIAL);
     _httpConnections = [NSMutableDictionary new];
+    _playbackQueue = dispatch_queue_create("com.suuqencode.playbackqueue",
+                                           DISPATCH_QUEUE_SERIAL);
   }
   return self;
 }
@@ -499,6 +508,103 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
   }
 }
 
+#pragma mark - PCM Streaming Playback
+
+RCT_EXPORT_METHOD(startPcmPlayer:(double)sampleRate
+                  channels:(double)channels
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject) {
+  if (self.isPlaybackActive) {
+    // Already running — just resolve
+    resolve(@(YES));
+    return;
+  }
+
+  double rate = sampleRate > 0 ? sampleRate : 24000.0;
+  int ch = channels > 0 ? (int)channels : 1;
+
+  // 16-bit signed integer PCM at the given sample rate
+  AudioStreamBasicDescription asbd = {};
+  asbd.mFormatID = kAudioFormatLinearPCM;
+  asbd.mSampleRate = rate;
+  asbd.mChannelsPerFrame = (UInt32)ch;
+  asbd.mBitsPerChannel = 16;
+  asbd.mBytesPerFrame = 2 * (UInt32)ch;
+  asbd.mBytesPerPacket = 2 * (UInt32)ch;
+  asbd.mFramesPerPacket = 1;
+  asbd.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+
+  self.playbackFormat = [[AVAudioFormat alloc] initWithStreamDescription:&asbd];
+  if (!self.playbackFormat) {
+    reject(@"FORMAT_ERROR", @"Could not create playback format", nil);
+    return;
+  }
+
+  // Use a separate engine for playback so it doesn't interfere with
+  // the recording engine.  If the recording engine is already running
+  // the audio session is shared.
+  self.playbackEngine = [[AVAudioEngine alloc] init];
+  self.playerNode = [[AVAudioPlayerNode alloc] init];
+
+  [self.playbackEngine attachNode:self.playerNode];
+  [self.playbackEngine connect:self.playerNode
+                            to:self.playbackEngine.mainMixerNode
+                        format:self.playbackFormat];
+
+  NSError *error = nil;
+  [self.playbackEngine startAndReturnError:&error];
+  if (error) {
+    reject(@"ENGINE_ERROR", error.localizedDescription, error);
+    self.playbackEngine = nil;
+    self.playerNode = nil;
+    return;
+  }
+
+  [self.playerNode play];
+  self.isPlaybackActive = YES;
+  resolve(@(YES));
+}
+
+RCT_EXPORT_METHOD(writePcmData:(NSString *)base64Data) {
+  if (!self.isPlaybackActive || !self.playerNode) return;
+
+  NSData *pcmData = [[NSData alloc] initWithBase64EncodedString:base64Data
+                                                        options:0];
+  if (!pcmData || pcmData.length == 0) return;
+
+  AVAudioFormat *fmt = self.playbackFormat;
+  UInt32 bytesPerFrame = fmt.streamDescription->mBytesPerFrame;
+  AVAudioFrameCount frameCount = (AVAudioFrameCount)(pcmData.length / bytesPerFrame);
+  if (frameCount == 0) return;
+
+  AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:fmt
+                                                          frameCapacity:frameCount];
+  buffer.frameLength = frameCount;
+  memcpy(buffer.int16ChannelData[0], pcmData.bytes, frameCount * bytesPerFrame);
+
+  // Schedule on the player node.  AVAudioPlayerNode internally queues
+  // buffers and plays them back-to-back with sample-accurate timing
+  // — zero gap between consecutive scheduleBuffer calls.
+  [self.playerNode scheduleBuffer:buffer completionHandler:nil];
+}
+
+RCT_EXPORT_METHOD(stopPcmPlayer) {
+  if (!self.isPlaybackActive) return;
+  self.isPlaybackActive = NO;
+
+  if (self.playerNode) {
+    [self.playerNode stop];
+  }
+  if (self.playbackEngine) {
+    [self.playbackEngine stop];
+  }
+  self.playerNode = nil;
+  self.playbackEngine = nil;
+  self.playbackFormat = nil;
+
+  [self sendEventWithName:@"onPcmPlayerStopped" body:@{}];
+}
+
 #pragma mark - HTTP Streaming
 
 RCT_EXPORT_METHOD(httpCreate:(NSString *)connectionId
@@ -631,7 +737,8 @@ RCT_EXPORT_METHOD(httpClose:(NSString *)connectionId) {
     @"onHttpData",
     @"onHttpWriteComplete",
     @"onHttpError",
-    @"onHttpComplete"
+    @"onHttpComplete",
+    @"onPcmPlayerStopped"
   ];
 }
 
@@ -640,6 +747,16 @@ RCT_EXPORT_METHOD(httpClose:(NSString *)connectionId) {
 }
 
 - (void)invalidate {
+  // Clean up PCM player
+  if (self.isPlaybackActive) {
+    self.isPlaybackActive = NO;
+    [self.playerNode stop];
+    [self.playbackEngine stop];
+    self.playerNode = nil;
+    self.playbackEngine = nil;
+    self.playbackFormat = nil;
+  }
+
   // Clean up all HTTP connections when the module is invalidated
   @synchronized(self.httpConnections) {
     for (SuuqeHttpConnection *conn in self.httpConnections.allValues) {
