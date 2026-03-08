@@ -24,8 +24,7 @@
 @property(nonatomic, strong)
     NSMutableDictionary<NSString *, SuuqeHttpConnection *> *httpConnections;
 
-// PCM streaming playback
-@property(nonatomic, strong) AVAudioEngine *playbackEngine;
+// PCM streaming playback (uses the shared audioEngine above)
 @property(nonatomic, strong) AVAudioPlayerNode *playerNode;
 @property(nonatomic, strong) AVAudioFormat *playbackFormat;
 @property(nonatomic) BOOL isPlaybackActive;
@@ -255,8 +254,12 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
 
   if (self.audioEngine) {
     [self.audioEngine.inputNode removeTapOnBus:0];
-    [self.audioEngine stop];
-    self.audioEngine = nil;
+
+    // Only tear down the shared engine if playback isn't using it
+    if (!self.isPlaybackActive) {
+      [self.audioEngine stop];
+      self.audioEngine = nil;
+    }
   }
 
   self.pcmConverter = nil;
@@ -279,16 +282,11 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
     return NO;
   }
 
-  // Voice-chat mode activates the Voice Processing IO audio unit on the
-  // hardware input node, which provides acoustic echo cancellation (AEC),
-  // automatic gain control (AGC), and noise suppression.  This prevents
-  // Gemini from hearing its own playback through the microphone.
-  [session setMode:AVAudioSessionModeVoiceChat error:&error];
-  if (error) {
-    NSLog(@"[Suuqencode] Warning: could not set VoiceChat mode: %@", error);
-    // Non-fatal — continue without AEC rather than failing the whole capture.
-    error = nil;
-  }
+  // NOTE: We intentionally do NOT set AVAudioSessionModeVoiceChat here.
+  // That mode routes audio to the earpiece, overriding DefaultToSpeaker.
+  // Instead we rely on setVoiceProcessingEnabled:YES on the AVAudioInputNode
+  // (below) which directly activates the VPIO audio unit for AEC without
+  // changing the output routing.
 
   [session setActive:YES error:&error];
   if (error) {
@@ -296,18 +294,41 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
     return NO;
   }
 
-  // Initialize audio engine
-  self.audioEngine = [[AVAudioEngine alloc] init];
+  // Reuse the shared engine if playback already started one, else create new.
+  // We must use a SINGLE AVAudioEngine for both recording and playback so
+  // that the Voice Processing IO unit (AEC) can reference the output signal.
+  BOOL playbackWasActive = (self.audioEngine != nil && self.isPlaybackActive);
+  AVAudioFormat *savedPlaybackFormat = self.playbackFormat;
+
+  if (self.audioEngine.isRunning) {
+    // Must stop before enabling voice processing
+    [self.audioEngine stop];
+  }
+  if (!self.audioEngine) {
+    self.audioEngine = [[AVAudioEngine alloc] init];
+  }
+
   AVAudioInputNode *inputNode = self.audioEngine.inputNode;
 
   // Explicitly enable Voice Processing on the input node (iOS 13+).
   // This activates the hardware AEC / noise-suppression unit so the mic
   // signal has the speaker output (Gemini's voice) subtracted from it.
+  // Enabling VPIO swaps the underlying audio unit, which can invalidate
+  // existing node connections — we reconnect the player node below.
   if (@available(iOS 13.0, *)) {
     NSError *vpError = nil;
     if (![inputNode setVoiceProcessingEnabled:YES error:&vpError]) {
       NSLog(@"[Suuqencode] Warning: could not enable voice processing: %@", vpError);
     }
+  }
+
+  // Reconnect the player node if it was attached, because enabling VPIO
+  // changes the audio unit topology and can invalidate prior connections.
+  if (playbackWasActive && self.playerNode && savedPlaybackFormat) {
+    [self.audioEngine disconnectNodeOutput:self.playerNode];
+    [self.audioEngine connect:self.playerNode
+                           to:self.audioEngine.mainMixerNode
+                       format:savedPlaybackFormat];
   }
 
   AVAudioFormat *hardwareFormat = [inputNode outputFormatForBus:0];
@@ -438,13 +459,21 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
     });
   }];
 
-  // Start the engine
+  // Start (or restart) the engine
   [self.audioEngine startAndReturnError:&error];
   if (error) {
     if (outError) *outError = error;
     [inputNode removeTapOnBus:0];
-    self.audioEngine = nil;
+    if (!self.isPlaybackActive) {
+      self.audioEngine = nil;
+    }
     return NO;
+  }
+
+  // If a player node was active before we stopped the engine to enable
+  // voice processing, resume it now that the engine is running again.
+  if (playbackWasActive && self.playerNode) {
+    [self.playerNode play];
   }
 
   self.isRecordingAudio = YES;
@@ -562,24 +591,36 @@ RCT_EXPORT_METHOD(startPcmPlayer:(double)sampleRate
     return;
   }
 
-  // Use a separate engine for playback so it doesn't interfere with
-  // the recording engine.  If the recording engine is already running
-  // the audio session is shared.
-  self.playbackEngine = [[AVAudioEngine alloc] init];
+  // Use the shared audioEngine for playback.  When recording starts
+  // later, voice processing (AEC) will reference this engine's output
+  // to cancel speaker audio from the mic signal.
+  BOOL needsStart = NO;
+  if (!self.audioEngine) {
+    self.audioEngine = [[AVAudioEngine alloc] init];
+    needsStart = YES;
+  } else if (!self.audioEngine.isRunning) {
+    needsStart = YES;
+  }
+
   self.playerNode = [[AVAudioPlayerNode alloc] init];
 
-  [self.playbackEngine attachNode:self.playerNode];
-  [self.playbackEngine connect:self.playerNode
-                            to:self.playbackEngine.mainMixerNode
+  [self.audioEngine attachNode:self.playerNode];
+  [self.audioEngine connect:self.playerNode
+                            to:self.audioEngine.mainMixerNode
                         format:self.playbackFormat];
 
-  NSError *error = nil;
-  [self.playbackEngine startAndReturnError:&error];
-  if (error) {
-    reject(@"ENGINE_ERROR", error.localizedDescription, error);
-    self.playbackEngine = nil;
-    self.playerNode = nil;
-    return;
+  if (needsStart) {
+    NSError *error = nil;
+    [self.audioEngine startAndReturnError:&error];
+    if (error) {
+      reject(@"ENGINE_ERROR", error.localizedDescription, error);
+      [self.audioEngine detachNode:self.playerNode];
+      self.playerNode = nil;
+      if (!self.isRecordingAudio) {
+        self.audioEngine = nil;
+      }
+      return;
+    }
   }
 
   [self.playerNode play];
@@ -616,13 +657,18 @@ RCT_EXPORT_METHOD(stopPcmPlayer) {
 
   if (self.playerNode) {
     [self.playerNode stop];
-  }
-  if (self.playbackEngine) {
-    [self.playbackEngine stop];
+    if (self.audioEngine) {
+      [self.audioEngine detachNode:self.playerNode];
+    }
   }
   self.playerNode = nil;
-  self.playbackEngine = nil;
   self.playbackFormat = nil;
+
+  // Only tear down the shared engine if recording isn't using it
+  if (!self.isRecordingAudio && self.audioEngine) {
+    [self.audioEngine stop];
+    self.audioEngine = nil;
+  }
 
   [self sendEventWithName:@"onPcmPlayerStopped" body:@{}];
 }
@@ -773,10 +819,19 @@ RCT_EXPORT_METHOD(httpClose:(NSString *)connectionId) {
   if (self.isPlaybackActive) {
     self.isPlaybackActive = NO;
     [self.playerNode stop];
-    [self.playbackEngine stop];
     self.playerNode = nil;
-    self.playbackEngine = nil;
     self.playbackFormat = nil;
+  }
+  // Clean up shared audio engine
+  if (self.isRecordingAudio) {
+    self.isRecordingAudio = NO;
+    if (self.audioEngine) {
+      [self.audioEngine.inputNode removeTapOnBus:0];
+    }
+  }
+  if (self.audioEngine) {
+    [self.audioEngine stop];
+    self.audioEngine = nil;
   }
 
   // Clean up all HTTP connections when the module is invalidated
