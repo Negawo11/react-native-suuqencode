@@ -279,6 +279,17 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
     return NO;
   }
 
+  // Voice-chat mode activates the Voice Processing IO audio unit on the
+  // hardware input node, which provides acoustic echo cancellation (AEC),
+  // automatic gain control (AGC), and noise suppression.  This prevents
+  // Gemini from hearing its own playback through the microphone.
+  [session setMode:AVAudioSessionModeVoiceChat error:&error];
+  if (error) {
+    NSLog(@"[Suuqencode] Warning: could not set VoiceChat mode: %@", error);
+    // Non-fatal — continue without AEC rather than failing the whole capture.
+    error = nil;
+  }
+
   [session setActive:YES error:&error];
   if (error) {
     if (outError) *outError = error;
@@ -288,6 +299,17 @@ RCT_EXPORT_METHOD(stopAudioEncode) {
   // Initialize audio engine
   self.audioEngine = [[AVAudioEngine alloc] init];
   AVAudioInputNode *inputNode = self.audioEngine.inputNode;
+
+  // Explicitly enable Voice Processing on the input node (iOS 13+).
+  // This activates the hardware AEC / noise-suppression unit so the mic
+  // signal has the speaker output (Gemini's voice) subtracted from it.
+  if (@available(iOS 13.0, *)) {
+    NSError *vpError = nil;
+    if (![inputNode setVoiceProcessingEnabled:YES error:&vpError]) {
+      NSLog(@"[Suuqencode] Warning: could not enable voice processing: %@", vpError);
+    }
+  }
+
   AVAudioFormat *hardwareFormat = [inputNode outputFormatForBus:0];
 
   if (!hardwareFormat || hardwareFormat.sampleRate == 0) {
