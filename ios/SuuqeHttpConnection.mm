@@ -1,12 +1,4 @@
 #import "SuuqeHttpConnection.h"
-#import <CommonCrypto/CommonDigest.h>
-
-/// SHA-256 fingerprint (uppercase hex, no colons) of the self-signed
-/// certificate served by video.suuqe.com:8443.  Connections to this
-/// host will be accepted ONLY if the leaf cert matches this hash.
-static NSString *const kPinnedCertSHA256 =
-    @"2171186A90E4176AE8F092824A093BA06890EBC80B72D9D89ED02C0ACBB2E281";
-static NSString *const kPinnedHost = @"video.suuqe.com";
 
 @interface SuuqeHttpConnection () <NSURLSessionDataDelegate, NSStreamDelegate>
 
@@ -267,54 +259,6 @@ static NSString *const kPinnedHost = @"video.suuqe.com";
     break;
   default:
     break;
-  }
-}
-
-#pragma mark - NSURLSessionDelegate (TLS Certificate Pinning)
-
-- (void)URLSession:(NSURLSession *)session
-    didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
-      completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition,
-                                  NSURLCredential *_Nullable))completionHandler {
-  NSString *host = challenge.protectionSpace.host;
-  SecTrustRef serverTrust = challenge.protectionSpace.serverTrust;
-
-  // Only apply custom pinning for our direct backend host
-  if (![host isEqualToString:kPinnedHost] || !serverTrust ||
-      challenge.protectionSpace.authenticationMethod !=
-          NSURLAuthenticationMethodServerTrust) {
-    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
-    return;
-  }
-
-  // Extract the leaf certificate
-  SecCertificateRef leafCert = SecTrustGetCertificateAtIndex(serverTrust, 0);
-  if (!leafCert) {
-    completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge,
-                      nil);
-    return;
-  }
-
-  // Compute SHA-256 of the DER-encoded certificate
-  NSData *certData = (__bridge_transfer NSData *)SecCertificateCopyData(leafCert);
-  uint8_t digest[CC_SHA256_DIGEST_LENGTH];
-  CC_SHA256(certData.bytes, (CC_LONG)certData.length, digest);
-
-  NSMutableString *hexHash =
-      [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
-  for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
-    [hexHash appendFormat:@"%02X", digest[i]];
-  }
-
-  if ([hexHash isEqualToString:kPinnedCertSHA256]) {
-    NSURLCredential *credential =
-        [NSURLCredential credentialForTrust:serverTrust];
-    completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
-  } else {
-    NSLog(@"[SuuqeHttp] Certificate pinning FAILED for %@. Got: %@", host,
-          hexHash);
-    completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge,
-                      nil);
   }
 }
 
