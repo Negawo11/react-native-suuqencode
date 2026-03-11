@@ -12,6 +12,9 @@ export interface Spec extends TurboModule {
   writePcmData(base64Data: string): void;
   stopPcmPlayer(): void;
 
+  // DeviceCheck
+  getDeviceToken(): Promise<string>;
+
   // HTTP streaming
   httpCreate(
     connectionId: string,

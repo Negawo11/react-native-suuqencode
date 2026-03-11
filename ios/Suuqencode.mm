@@ -1,6 +1,7 @@
 #import "Suuqencode.h"
 #import "SuuqeHttpConnection.h"
 #import <SuuqeDMABuf/DMABuf.h>
+#import <DeviceCheck/DeviceCheck.h>
 
 @interface Suuqencode ()
 
@@ -791,6 +792,30 @@ RCT_EXPORT_METHOD(httpClose:(NSString *)connectionId) {
   // Remove completed connection from tracking
   @synchronized(self.httpConnections) {
     [self.httpConnections removeObjectForKey:connectionId];
+  }
+}
+
+#pragma mark - DeviceCheck
+
+RCT_EXPORT_METHOD(getDeviceToken:(RCTPromiseResolveBlock)resolve
+                 reject:(RCTPromiseRejectBlock)reject)
+{
+  if (@available(iOS 11.0, *)) {
+    if (!DCDevice.currentDevice.isSupported) {
+      reject(@"DEVICE_CHECK_UNSUPPORTED", @"DeviceCheck is not supported on this device (simulator?)", nil);
+      return;
+    }
+    [DCDevice.currentDevice generateTokenWithCompletionHandler:^(NSData * _Nullable token, NSError * _Nullable error) {
+      if (error) {
+        reject(@"DEVICE_CHECK_ERROR", error.localizedDescription, error);
+      } else if (!token || token.length == 0) {
+        reject(@"DEVICE_CHECK_ERROR", @"DeviceCheck token was empty", nil);
+      } else {
+        resolve([token base64EncodedStringWithOptions:0]);
+      }
+    }];
+  } else {
+    reject(@"DEVICE_CHECK_UNSUPPORTED", @"DeviceCheck requires iOS 11+", nil);
   }
 }
 

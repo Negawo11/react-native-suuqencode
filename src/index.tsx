@@ -134,6 +134,19 @@ export function addPcmPlayerStoppedListener(callback: () => void): () => void {
 }
 
 // ---------------------------------------------------------------------------
+// DeviceCheck
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate an Apple DeviceCheck token for device attestation.
+ * Only available on physical iOS 11+ devices; rejects on simulators.
+ * @returns Promise resolving to a base64-encoded DeviceCheck token string.
+ */
+export function getDeviceToken(): Promise<string> {
+  return Suuqencode.getDeviceToken();
+}
+
+// ---------------------------------------------------------------------------
 // HTTP Streaming
 // ---------------------------------------------------------------------------
 
